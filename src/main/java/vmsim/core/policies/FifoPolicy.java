@@ -24,55 +24,103 @@ public class FifoPolicy implements EvictionPolicy {
         while (true) {
             Frame victimFrame = fifoQueue.poll();
             if (victimFrame == null) {
+                // This can happen if queue is empty.
+                // Fallback to just grabbing the first frame.
                 victimFrame = frameList.get(0);
             }
 
             victimFrame.lock.lock();
             try {
-                if (victimFrame.pinned || victimFrame.isFree()) {
+                // Check 1: Frame must be occupied and not pinned
+                if (victimFrame.pinned() || victimFrame.isFree()) {
                     if (!victimFrame.isFree()) {
+                        // It's pinned, add it back to the queue
                         fifoQueue.add(victimFrame);
                     }
                     continue;
                 }
 
-                PTE victimPTE = victimFrame.pte;
-                if (victimPTE == null) {
-                    continue;
+                // Create a stable list of PTEs to check
+                List<PTE> ptesToEvict = new ArrayList<>(victimFrame.ptes);
+                if (ptesToEvict.isEmpty()) {
+                    continue; // Frame became free
                 }
 
-                if (!victimPTE.lock.tryLock()) {
+                // Check 2: ATOMICALLY acquire ALL PTE locks
+                List<PTE> locksAcquired = new ArrayList<>();
+                boolean allLocksAcquired = true;
+
+                for (PTE pte : ptesToEvict) {
+                    if (!pte.lock.tryLock()) {
+                        // FAILURE.
+                        allLocksAcquired = false;
+                        // "Wind back down"
+                        for (int i = locksAcquired.size() - 1; i >= 0; i--) {
+                            locksAcquired.get(i).lock.unlock();
+                        }
+                        break; // Exit the for-loop
+                    }
+                    locksAcquired.add(pte);
+                }
+
+                if (!allLocksAcquired) {
+                    // This frame is busy. Add it back to the end of the queue
+                    // so we can try it again later, and move on.
                     fifoQueue.add(victimFrame);
                     continue;
                 }
 
+                // --- VICTIM CANDIDATE FOUND ---
+                // We now hold the frame.lock AND all pte.locks
                 try {
-                    if (victimFrame.pinned || victimFrame.pte != victimPTE || !victimPTE.inFrame) {
-                        fifoQueue.add(victimFrame);
+                    // Check 3: Re-validate state.
+                    if (victimFrame.pinned() || victimFrame.ptes.isEmpty()) {
                         continue;
                     }
 
-                    // --- VICTIM FOUND ---
-                    log("Evicting VPN " + victimPTE.vaddr + " from Frame " + victimFrame.kpage, opLog);
+                    // Check 4: FIFO logic.
+                    // (FIFO doesn't check 'accessed' bit, it's a "dumb" policy.
+                    // We found our victim just by polling it.)
 
-                    if (victimPTE.dirty) {
-                        if (victimPTE.type == PTE.PageType.FILE && victimPTE.writable) {
-                            log("WRITEBACK: FILE Page " + victimPTE.vaddr + " (offset " + victimPTE.fileOffset + ") to " + victimPTE.filename, opLog);
-                        } else if (victimPTE.type == PTE.PageType.ANONYMOUS) {
-                            log("WRITEBACK: ANONYMOUS Page " + victimPTE.vaddr + " is dirty, saving to swap.", opLog);
-                            victimPTE.onSwap = true;
+                    // --- VICTIM CONFIRMED ---
+                    PTE repPTE = locksAcquired.get(0);
+                    log("Evicting Frame " + victimFrame.kpage + " (Type: " + repPTE.type + ", Sharers: " + locksAcquired.size() + ")", opLog);
+
+                    // Handle Writeback
+                    if (repPTE.type == PTE.PageType.FILE) {
+                        boolean isDirty = false;
+                        for(PTE pte : locksAcquired) {
+                            if (pte.dirty && pte.writable) {
+                                isDirty = true;
+                                break;
+                            }
+                        }
+                        if (isDirty) {
+                            log("WRITEBACK: FILE Page " + repPTE.vaddr + " (offset " + repPTE.fileOffset + ") to " + repPTE.filename, opLog);
+                        }
+                    } else if (repPTE.type == PTE.PageType.ANONYMOUS) {
+                        if (repPTE.dirty) {
+                            log("WRITEBACK: ANONYMOUS Page " + repPTE.vaddr + " is dirty, saving to swap.", opLog);
+                            repPTE.onSwap = true;
                         }
                     }
-                    victimPTE.inFrame = false;
-                    victimPTE.frame = null;
-                    victimFrame.pte = null;
 
-                    victimFrame.pinned = true;
+                    // The "Shootdown"
+                    for (PTE pte : locksAcquired) {
+                        pte.inFrame = false;
+                        pte.frame = null;
+                    }
+
+                    victimFrame.ptes.clear();
+                    victimFrame.pin();
 
                     return victimFrame.kpage;
 
                 } finally {
-                    victimPTE.lock.unlock();
+                    // Release all the PTE locks
+                    for (PTE pte : locksAcquired) {
+                        pte.lock.unlock();
+                    }
                 }
             } finally {
                 victimFrame.lock.unlock();
@@ -82,11 +130,12 @@ public class FifoPolicy implements EvictionPolicy {
 
     @Override
     public void onAccess(PTE pte) {
-        // Do nothing
+        // Do nothing for FIFO
     }
 
     @Override
     public void onLoad(Frame frame) {
+        // Add to the end of the queue when loaded
         fifoQueue.add(frame);
     }
 

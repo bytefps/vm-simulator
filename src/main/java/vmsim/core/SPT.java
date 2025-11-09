@@ -99,18 +99,12 @@ public class SPT {
                 // --- PAGE FAULT ---
                 opLog.add("-> PAGE FAULT for Page Key " + pageKey);
 
-                if (this.frameTable.frame_get_page(pte, opLog)) {
+                if (this.frameTable.frame_get_page(pte, opLog, isWrite)) {
                     opLog.add("-> Page loaded.");
                     this.stats.recordFault();
                 } else {
                     opLog.add("-> !! Page load FAILED !!");
                 }
-
-                // The access was a write, mark dirty
-                if (isWrite) {
-                    pte.dirty = true;
-                }
-                // 'accessed' bit is set by frame_get_page
 
             } else {
                 // --- PAGE HIT ---
@@ -159,7 +153,7 @@ public class SPT {
             try {
                 if (pte.inFrame) {
                     frameToFree = pte.frame;
-                    frameToFree.pinned = true;
+                    frameToFree.pin();
                 }
             } finally {
                 pte.lock.unlock();
@@ -172,7 +166,7 @@ public class SPT {
                     // but it only happens at the end of a process.
                     System.out.println("SPT(Destroy): Writing back FILE page " + pte.vaddr + " (offset " + pte.fileOffset + ") to " + pte.filename);
                 }
-                this.frameTable.freeFrame(frameToFree);
+                this.frameTable.freeFrame(frameToFree, pte);
             }
         }
         entries.clear();

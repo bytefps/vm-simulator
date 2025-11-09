@@ -248,6 +248,14 @@ public class Simulator {
             Thread.currentThread().interrupt(); // Restore interrupted status
         }
 
+        System.out.println(  "\n---- Final Frame Table ----\n" +sharedSimulator.frameTable);
+
+        if (sharedSimulator.frameTable.allFramesNotPinned()) {
+            System.out.println("ALL FRAMES NOT PINNED :) !");
+        } else {
+            System.out.println("THERE IS A PINNED FRAME :(");
+        }
+
         // 6. Print final statistics
         sharedSimulator.printStatistics();
     }

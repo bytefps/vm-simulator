@@ -25,8 +25,11 @@ public class LruPolicy implements EvictionPolicy {
             Frame victimCandidate = null;
             long minTime = Long.MAX_VALUE;
 
+            // --- Find LRU Candidate ---
+            // This loop is "dirty" - it reads timestamps without locks.
+            // This is safe. We will re-validate under lock.
             for (Frame frame : frameList) {
-                if (!frame.pinned && !frame.isFree()) {
+                if (!(frame.pinned()) && !frame.isFree()) {
                     if (frame.policyTimestamp < minTime) {
                         minTime = frame.policyTimestamp;
                         victimCandidate = frame;
@@ -35,6 +38,8 @@ public class LruPolicy implements EvictionPolicy {
             }
 
             if (victimCandidate == null) {
+                // This shouldn't happen if the table is full, but
+                // it's a safe guard.
                 continue;
             }
 
@@ -42,46 +47,93 @@ public class LruPolicy implements EvictionPolicy {
             victimFrame.lock.lock();
 
             try {
-                if (victimFrame.pinned || victimFrame.isFree() || victimFrame.policyTimestamp > minTime) {
+                // Check 1: Re-validate.
+                // Did it get pinned, freed, or *accessed* (timestamp changed)
+                // while we were waiting for the lock?
+                if (victimFrame.pinned() || victimFrame.isFree() || victimFrame.policyTimestamp > minTime) {
                     continue;
                 }
 
-                PTE victimPTE = victimFrame.pte;
-                if (victimPTE == null) {
+                // Create a stable list of PTEs to check
+                List<PTE> ptesToEvict = new ArrayList<>(victimFrame.ptes);
+                if (ptesToEvict.isEmpty()) {
+                    continue; // Frame became free
+                }
+
+                // Check 2: ATOMICALLY acquire ALL PTE locks
+                List<PTE> locksAcquired = new ArrayList<>();
+                boolean allLocksAcquired = true;
+
+                for (PTE pte : ptesToEvict) {
+                    if (!pte.lock.tryLock()) {
+                        // FAILURE.
+                        allLocksAcquired = false;
+                        // "Wind back down"
+                        for (int i = locksAcquired.size() - 1; i >= 0; i--) {
+                            locksAcquired.get(i).lock.unlock();
+                        }
+                        break; // Exit the for-loop
+                    }
+                    locksAcquired.add(pte);
+                }
+
+                if (!allLocksAcquired) {
+                    // This releases the frame.lock (in finally) and
+                    // causes us to re-scan for the next LRU candidate.
                     continue;
                 }
 
-                if (!victimPTE.lock.tryLock()) {
-                    continue;
-                }
-
+                // --- VICTIM CANDIDATE FOUND ---
+                // We now hold the frame.lock AND all pte.locks
                 try {
-                    if (victimFrame.pinned || victimFrame.pte != victimPTE || !victimPTE.inFrame) {
+                    // Check 3: Re-validate state.
+                    if (victimFrame.pinned()|| victimFrame.ptes.isEmpty() || victimFrame.policyTimestamp > minTime) {
                         continue;
                     }
 
-                    // --- VICTIM FOUND ---
-                    log("Evicting VPN " + victimPTE.vaddr + " (LRU time=" + victimFrame.policyTimestamp + ") from Frame " + victimFrame.kpage, opLog);
+                    // Check 4: LRU logic.
+                    // (LRU doesn't check 'accessed' bit. The timestamp *is*
+                    // the check, and we've already validated it.)
 
-                    if (victimPTE.dirty) {
-                        if (victimPTE.type == PTE.PageType.FILE && victimPTE.writable) {
-                            log("WRITEBACK: FILE Page " + victimPTE.vaddr + " (offset " + victimPTE.fileOffset + ") to " + victimPTE.filename, opLog);
-                        } else if (victimPTE.type == PTE.PageType.ANONYMOUS) {
-                            log("WRITEBACK: ANONYMOUS Page " + victimPTE.vaddr + " is dirty, saving to swap.", opLog);
-                            victimPTE.onSwap = true;
+                    // --- VICTIM CONFIRMED ---
+                    PTE repPTE = locksAcquired.get(0);
+                    log("Evicting Frame " + victimFrame.kpage + " (Type: " + repPTE.type + ", Sharers: " + locksAcquired.size() + ", LRU time=" + victimFrame.policyTimestamp + ")", opLog);
+
+                    // Handle Writeback
+                    if (repPTE.type == PTE.PageType.FILE) {
+                        boolean isDirty = false;
+                        for(PTE pte : locksAcquired) {
+                            if (pte.dirty && pte.writable) {
+                                isDirty = true;
+                                break;
+                            }
+                        }
+                        if (isDirty) {
+                            log("WRITEBACK: FILE Page " + repPTE.vaddr + " (offset " + repPTE.fileOffset + ") to " + repPTE.filename, opLog);
+                        }
+                    } else if (repPTE.type == PTE.PageType.ANONYMOUS) {
+                        if (repPTE.dirty) {
+                            log("WRITEBACK: ANONYMOUS Page " + repPTE.vaddr + " is dirty, saving to swap.", opLog);
+                            repPTE.onSwap = true;
                         }
                     }
 
-                    victimPTE.inFrame = false;
-                    victimPTE.frame = null;
-                    victimFrame.pte = null;
+                    // The "Shootdown"
+                    for (PTE pte : locksAcquired) {
+                        pte.inFrame = false;
+                        pte.frame = null;
+                    }
 
-                    victimFrame.pinned = true;
+                    victimFrame.ptes.clear();
+                    victimFrame.pin();
 
                     return victimFrame.kpage;
 
                 } finally {
-                    victimPTE.lock.unlock();
+                    // Release all the PTE locks
+                    for (PTE pte : locksAcquired) {
+                        pte.lock.unlock();
+                    }
                 }
             } finally {
                 victimFrame.lock.unlock();
@@ -91,6 +143,7 @@ public class LruPolicy implements EvictionPolicy {
 
     @Override
     public void onAccess(PTE pte) {
+        // A page hit *is* an access. Update the timestamp.
         if (pte.frame != null) {
             pte.frame.policyTimestamp = accessTime.getAndIncrement();
         }
@@ -98,6 +151,7 @@ public class LruPolicy implements EvictionPolicy {
 
     @Override
     public void onLoad(Frame frame) {
+        // A page load *is* an access. Update the timestamp.
         frame.policyTimestamp = accessTime.getAndIncrement();
     }
 

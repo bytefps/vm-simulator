@@ -10,6 +10,7 @@ inspired by my implementation within the Pintos operating system.
 - Lazy page loading
 - A process 'dies' once its entire file is read
 - Outputs are synced to prevent interleaving between multiple threads.
+- Files loaded with read only are shareable between processes
 
 # How to run
 - Run by passing the command line arguments in the following format
