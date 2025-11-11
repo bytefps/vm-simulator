@@ -20,11 +20,11 @@ inspired by my implementation within the Pintos operating system.
 - Policy is optional, defaults to clock replacement
 - Available policies are clock, fifo and lru
 - To implement your own policy extend the EvictionPolicy interface.
-- any number of files to trace.
+- Provide any number of files to trace.
 
 # Trace file format
 The trace file uses 4 commands, each line contains one command each on a separate line
-- A <addr> <W|R>: Allocates an anonymous page in the page table (e.g. A 1000 W)
-- F <addr> <file> <offset> <W|R>: Allocates a file-backed page in the page table (e.g., F 2000 data.txt 0 R)
-- R <addr>: Read from an allocated page (e.g. R 1000)
-- W <addr>: Write to an allocated page (e.g., W 1000)
+- A <address> <W|R>: Allocates an anonymous page in the page table (e.g. A 1000 W)
+- F <address> <file> <offset> <W|R>: Allocates a file-backed page in the page table (e.g., F 2000 data.txt 0 R)
+- R <address>: Read from an allocated page (e.g. R 1000)
+- W <address>: Write to an allocated page (e.g., W 1000)
