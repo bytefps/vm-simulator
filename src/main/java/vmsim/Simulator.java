@@ -81,6 +81,16 @@ public class Simulator {
         private int hits = 0;
         private int faults = 0;
         private int accessCounter = 0;
+        private int cowFaults = 0;
+
+        public void recordCoWFault() {
+            statsLock.lock();
+            try {
+                cowFaults++;
+            } finally {
+                statsLock.unlock();
+            }
+        }
 
         public int atomicallyGetNextAccessNum() {
             statsLock.lock();
@@ -125,15 +135,16 @@ public class Simulator {
                 int total = accessCounter;
                 int currentHits = hits;
                 int currentFaults = faults;
+                int currentCoWFaults = cowFaults;
 
-                if (total != (currentHits + currentFaults)) {
-                    total = currentHits + currentFaults;
+                if (total != (currentHits + currentFaults + currentCoWFaults)) {
+                    total = currentHits + currentFaults + currentCoWFaults;
                 }
 
                 double hitRate = (total == 0) ? 0 : (100.0 * currentHits / total);
                 return String.format(
-                        "Total Accesses: %d\nPage Hits:      %d\nPage Faults:    %d\nHit Rate:         %.2f%%",
-                        total, currentHits, currentFaults, hitRate
+                        "Total Accesses: %d\nPage Hits:      %d\nPage Faults:    %d\nCoW Faults:     %d\nHit Rate:         %.2f%%",
+                        total, currentHits, currentFaults, currentCoWFaults, hitRate
                 );
             } finally {
                 statsLock.unlock();
@@ -255,6 +266,14 @@ public class Simulator {
         } else {
             System.out.println("THERE IS A PINNED FRAME :(");
         }
+
+        if (sharedSimulator.frameTable.allFramesFree()) {
+            System.out.println("ALL FRAMES FREE :) !");
+        } else {
+            System.out.println("NOT ALL FRAMES FREE :(");
+        }
+
+
 
         // 6. Print final statistics
         sharedSimulator.printStatistics();

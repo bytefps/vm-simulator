@@ -62,6 +62,72 @@ public class SPT {
         return true;
     }
 
+    /**
+     * Resolves a Copy-on-Write fault.
+     * MUST be called while holding the lock for the faulting PTE.
+     * Detaches the PTE from its shared frame and gives it a new
+     * private, writable frame with the same data.
+     *
+     * This is safe because eviction uses tryLock() and will not block.
+     */
+    private void handleCoWFault(PTE pte, List<String> opLog) {
+        // We are holding pte.lock
+
+        // old frame CANNOT be evicted as we hold the LOCK
+        Frame oldFrame = pte.frame;
+
+        if (oldFrame == null) {
+            // Page was CoW'd, then evicted before a write.
+            // This is just a normal fault now.
+            opLog.add("-> CoW: Page was not in frame. Converting to normal page fault.");
+            pte.isCopyOnWrite = false;
+            pte.writable = pte.fundamentalWritable;
+            return;
+        }
+
+        //  Detach this PTE from the shared frame's list
+        int oldFrameKpage = oldFrame.kpage; // Store this for copy
+        oldFrame.lock.lock(); // Lock frame (PTE -> Frame order, safe )
+        try {
+            oldFrame.pin();
+            oldFrame.ptes.remove(pte);
+        } finally {
+            oldFrame.lock.unlock();
+        }
+
+        // Old frame could have been evicted if we did not pin
+
+        // Trick the frame table into loading data into a new frame
+        pte.inFrame = false;
+        pte.frame = null;
+
+        //  Load the page into a new private frame.
+        // We are still holding the PTE lock
+        opLog.add("-> CoW: Copying page " + pte.vaddr + " to new private frame.");
+
+        // This is the call that can evict. It's safe due to tryLock().
+        if (!this.frameTable.frame_get_cow_page(pte, oldFrameKpage, opLog, true)) {
+            // This really shouldn't fail unless getFrame fails
+            // KERNEL PANIC
+            throw new RuntimeException("CoW: frame_get_page failed to load private frame");
+        }
+
+        // Copy is done we can now unpin it safely, get evicted, I DONT CARE
+        oldFrame.lock.lock();
+        try {
+            oldFrame.unpin();
+        } finally {
+            oldFrame.lock.unlock();
+        }
+
+        // Update PTE state
+        // pte.inFrame and pte.frame were set by frame_get_page.
+        pte.isCopyOnWrite = false;
+        pte.writable = pte.fundamentalWritable;
+        // pte.dirty will be set by the caller (accessMemory)
+    }
+
+
 
     /**
      * The main MMU logic.
@@ -86,37 +152,50 @@ public class SPT {
         }
 
         // The page *exists*, but the process is trying to WRITE
-        // to a READ-ONLY page. This is a Protection Fault.
-        if (isWrite && !pte.writable) {
-            opLog.add("-> PROTECTION FAULT: Tried to write to read-only page.");
-            logOperation(opLog);
-            throw new UnauthorizedAccessException("Protection Fault at 0x" + Integer.toHexString(address));
-        }
-
+        // to a READ-ONLY page. This is a Protection Fault. --new-- or COW fault
         pte.lock.lock();
         try {
-            if (!pte.inFrame) {
-                // --- PAGE FAULT ---
-                opLog.add("-> PAGE FAULT for Page Key " + pageKey);
+            boolean isCoWFault = false;
 
-                if (this.frameTable.frame_get_page(pte, opLog, isWrite)) {
-                    opLog.add("-> Page loaded.");
-                    this.stats.recordFault();
+            if (isWrite && !pte.writable) {
+                // Is it a COW Fault or an actual protection fault?
+                if (pte.isCopyOnWrite) {
+                    opLog.add("-> COPY-ON-WRITE FAULT for Page Key " + pageKey);
+                    // This will give pte a new private frame.
+                    handleCoWFault(pte, opLog);
+                    this.stats.recordCoWFault();
+                    isCoWFault = true;
+                    // The fault is now resolved. pte.writable is true.
+                    // We can now continue to the hit/fault logic below.
                 } else {
-                    opLog.add("-> !! Page load FAILED !!");
-                }
-
-            } else {
-                // --- PAGE HIT ---
-                opLog.add("-> PAGE HIT for Page Key " + pageKey + " in Frame " + pte.frame.kpage);
-                this.stats.recordHit();
-
-                this.frameTable.onAccess(pte);
-
-                if (isWrite) {
-                    pte.dirty = true;
+                    // --- No, it's a REAL Protection Fault. ---
+                    opLog.add("-> PROTECTION FAULT: Tried to write to read-only page.");
+                    logOperation(opLog);
+                    throw new UnauthorizedAccessException("Protection Fault at 0x" + Integer.toHexString(address));
                 }
             }
+
+                if (!pte.inFrame) {
+                    // --- PAGE FAULT ---
+                    opLog.add("-> PAGE FAULT for Page Key " + pageKey);
+
+                    if (this.frameTable.frame_get_page(pte, opLog, isWrite)) {
+                        opLog.add("-> Page loaded.");
+                        this.stats.recordFault();
+                    } else {
+                        opLog.add("-> !! Page load FAILED !!");
+                    }
+
+                } else {
+                    if (!isCoWFault) {
+                        opLog.add("-> PAGE HIT for Page Key " + pageKey + " in Frame " + pte.frame.kpage);
+                        this.stats.recordHit();
+                        this.frameTable.onAccess(pte);
+                    }
+                    if (isWrite) {
+                        pte.dirty = true;
+                    }
+                }
         } finally {
             pte.lock.unlock();
         }
@@ -170,5 +249,57 @@ public class SPT {
             }
         }
         entries.clear();
+    }
+
+    public boolean setupCopyOnWrite(int newVpn, int sourceVpn) {
+        PTE sourcePTE = lookup(sourceVpn);
+        if (sourcePTE == null) {
+            return false; // Source doesn't exist
+        }
+        if (lookup(newVpn) != null) {
+            return false; // Destination already allocated
+        }
+
+        // We must lock the source PTE to safely copy its state
+        sourcePTE.lock.lock();
+        try {
+            // Create the new PTE. It must match the source's type.
+            PTE newPTE;
+            if (sourcePTE.type == PTE.PageType.ANONYMOUS) {
+                newPTE = new PTE(newVpn, sourcePTE.fundamentalWritable, this.processID);
+            } else {
+                newPTE = new PTE(newVpn, sourcePTE.fundamentalWritable, this.processID, sourcePTE.filename, sourcePTE.fileOffset);
+            }
+
+            // Mark both as CoW pages - Lie about there being 'two' copies
+            sourcePTE.isCopyOnWrite = true;
+            newPTE.isCopyOnWrite = true;
+
+            // Set them as read only so they fault when written to
+            sourcePTE.writable = false;
+            newPTE.writable = false;
+
+            // Make newPTE share the same data source (frame or swap)
+            newPTE.inFrame = sourcePTE.inFrame;
+            newPTE.frame = sourcePTE.frame;
+            newPTE.onSwap = sourcePTE.onSwap;
+
+            // If it's in a frame, add newPTE as a sharer
+            if (newPTE.inFrame) {
+                Frame sharedFrame = newPTE.frame;
+                sharedFrame.lock.lock();
+                try {
+                    sharedFrame.ptes.add(newPTE);
+                } finally {
+                    sharedFrame.lock.unlock();
+                }
+            }
+
+            entries.put(newVpn, newPTE);
+            return true;
+
+        } finally {
+            sourcePTE.lock.unlock();
+        }
     }
 }

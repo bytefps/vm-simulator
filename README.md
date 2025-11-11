@@ -28,3 +28,4 @@ The trace file uses 4 commands, each line contains one command each on a separat
 - F <address> <file> <offset> <W|R>: Allocates a file-backed page in the page table (e.g., F 2000 data.txt 0 R)
 - R <address>: Read from an allocated page (e.g. R 1000)
 - W <address>: Write to an allocated page (e.g., W 1000)
+- C <new_addr> <source_addr>: Creates a virtual copy of source_addr at new_addr (e.g. C 3000 1000)

@@ -12,7 +12,10 @@ public class PTE {
     public final int vaddr; // Virtual address of the Page table entry
     public final String processID; // Owning processID (Used in output)
     public final ReentrantLock lock; // Lock to sync access to PTE fields between Eviction
-    public final boolean writable; // Read only field to determine if PTE represents writable data
+
+    public final boolean fundamentalWritable; // Read only field to determine if PTE represents writable data
+    public boolean writable; // Current write state
+    public boolean isCopyOnWrite = false; // Is it a copy on write
 
     public boolean inFrame; // A PTE is either inFrame , onSwap or on DISK
     public boolean onSwap; // Only in swap if anonymous page
@@ -27,6 +30,7 @@ public class PTE {
         this.vaddr = vaddr;
         this.processID = processID;
         this.writable = writable;
+        this.fundamentalWritable = writable;
         this.lock = new ReentrantLock();
         this.frame = null;
 
@@ -46,6 +50,7 @@ public class PTE {
         this.vaddr = vaddr;
         this.processID = processID;
         this.writable = writable;
+        this.fundamentalWritable = writable;
         this.lock = new ReentrantLock();
         this.frame = null;
 

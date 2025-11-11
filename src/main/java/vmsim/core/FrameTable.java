@@ -241,6 +241,41 @@ public class FrameTable {
         return true;
     }
 
+    public boolean frame_get_cow_page(PTE pte, int oldFrameKpage, List<String> opLog, boolean isWrite) {
+        // We are holding the PTE lock.
+        // Old frame is pinned, it cannot be evicted
+
+        // This returns a *pinned* frame index.
+        int newFrameIndex = getFrame(opLog);
+        if (newFrameIndex == -1) {
+            throw new RuntimeException("EVICTION BROKEN, GET FRAME RETURNED -1!"); // Should not happen if evict works
+        }
+        Frame newFrame = frameList.get(newFrameIndex);
+
+        // Perform the copy and state update
+        newFrame.lock.lock();
+        try {
+            // Simulate the memory copy.
+            log("Copying page " + pte.vaddr + " from Frame " + oldFrameKpage + " to Frame " + newFrame.kpage, opLog);
+
+            // Attach to new frame
+            pte.inFrame = true;
+            pte.frame = newFrame;
+            newFrame.ptes.add(pte);
+
+            pte.accessed = true;
+            pte.dirty = isWrite; // Will be true
+
+            // Send notice to eviction policy
+            this.evictionPolicy.onLoad(newFrame);
+
+        } finally {
+            newFrame.unpin();
+            newFrame.lock.unlock();
+        }
+        return true;
+    }
+
 
     private void log(String message, List<String> opLog) {
         opLog.add("FrameTable: " + message);
@@ -303,6 +338,15 @@ public class FrameTable {
     public boolean allFramesNotPinned() {
         for (Frame frame : frameList) {
             if (frame.pinned()) {
+                return false;
+            }
+        }
+        return true;
+    }
+
+    public boolean allFramesFree() {
+        for (Frame frame : frameList) {
+            if (!frame.ptes.isEmpty()) {
                 return false;
             }
         }

@@ -108,6 +108,28 @@ public class SimulatedProcess implements Runnable {
                                 this.spt.accessMemory(address, true);
                                 break;
 
+                            case "C": // Copy-on-Write
+                                if (parts.length < 3) {
+                                    System.err.println("FATAL: [" + processID + "] Invalid 'C' command: " + line);
+                                    return;
+                                }
+                                try {
+                                    // Note: parts[1] is the new_addr, parts[2] is the source_addr
+                                    int newAddress = Integer.parseInt(parts[1], 16);
+                                    int sourceAddress = Integer.parseInt(parts[2], 16);
+                                    int newPageKey = newAddress >> PAGE_SHIFT;
+                                    int sourcePageKey = sourceAddress >> PAGE_SHIFT;
+
+                                    if (!spt.setupCopyOnWrite(newPageKey, sourcePageKey)) {
+                                        simulator.log("FATAL [PID: " + processID + "]: CoW setup failed.");
+                                        return; // Kill this thread
+                                    }
+                                } catch (NumberFormatException e) {
+                                    System.err.println("FATAL: [" + processID + "] Invalid address in 'C' command: " + line);
+                                    return;
+                                }
+                                break;
+
                             default:
                                 System.err.println("FATAL: [" + processID + "] Invalid command: " + command);
                                 return;
