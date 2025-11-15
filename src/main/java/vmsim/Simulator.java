@@ -9,8 +9,10 @@ import vmsim.core.policies.FifoPolicy;
 import vmsim.core.policies.LruPolicy;
 // ------------------------------
 
+import java.io.IOException;
 import java.util.ArrayList;
 import java.util.List;
+import java.util.concurrent.Phaser;
 import java.util.concurrent.locks.ReentrantLock;
 
 
@@ -27,6 +29,9 @@ public class Simulator {
     // Global Statistics
     private final Statistics stats = new Statistics();
     private final ReentrantLock statsLock = new ReentrantLock();
+
+    // Used to start and join for new threads during fork
+    private final Phaser phaser = new Phaser(1);
 
     /**
      * Initializes the simulator with a set number of physical frames
@@ -178,7 +183,7 @@ public class Simulator {
      */
     public static void main(String[] args) {
 
-        // --- PARSING LOGIC ---
+        // Parsing logic
         if (args.length < 2) {
             System.err.println("Usage: java vmsim.Simulator <num_frames> [policy] <trace_file_1> ... <trace_file_n>");
             System.err.println("   <num_frames>: (Required) A positive integer (e.g., 8).");
@@ -194,7 +199,7 @@ public class Simulator {
 
         for (String arg : args) {
             try {
-                // 1. Try to parse as frame count
+                // Try to parse as frame count
                 int frames = Integer.parseInt(arg);
                 if (frames > 0) {
                     numPhysicalFrames = frames;
@@ -204,59 +209,58 @@ public class Simulator {
                 // Not an integer, continue to next checks
             }
 
-            // 2. Try to parse as policy
+            // Try to parse as policy
             String lowerArg = arg.toLowerCase();
             if (lowerArg.equals("clock") || lowerArg.equals("lru") || lowerArg.equals("fifo")) {
                 policyName = lowerArg;
                 continue; // Found it, move to next arg
             }
 
-            // 3. If it's not a frame count or policy, it's a file
+            //  If it's not a frame count or policy, it's a file
             traceFiles.add(arg);
         }
 
-        // --- VALIDATION ---
         if (numPhysicalFrames == -1) {
             System.err.println("FATAL: You must provide a valid, positive integer for <num_frames>.");
             return;
         }
         if (traceFiles.isEmpty()) {
-            System.err.println("FATAL: You must provide at least one trace file.");
-            return;
-        }
-        // --- END PARSING & VALIDATION ---
+      System.err.println("FATAL: You must provide at least one trace file.");
+      return;
+    }
 
-
-        // 1. Create the policy
+        //  Create the policy
         EvictionPolicy policy = createPolicy(policyName);
 
-        // 2. Initialize the ONE shared Simulator
+        //  Initialize the ONE shared Simulator
         Simulator sharedSimulator = new Simulator(numPhysicalFrames, policy);
 
-        // 3. Create a list of Threads
-        List<Thread> threads = traceFiles.stream()
-                .map(fileName -> {
-                    // Pass the "kernel" (sharedSimulator) to the process
-                    SimulatedProcess process = new SimulatedProcess(sharedSimulator, fileName);
-                    return new Thread(process, "Process-" + fileName);
-                })
-                .toList();
+        //  Create a list of Threads
+        List<Thread> initialThreads = new ArrayList<>();
+        for (String fileName : traceFiles) {
+            try {
+                // Pass the phaser to the process
+                SimulatedProcess process = new SimulatedProcess(sharedSimulator, fileName, sharedSimulator.phaser);
+                initialThreads.add(new Thread(process, "Process-" + fileName));
+                sharedSimulator.phaser.register();
+            } catch (IOException e) {
+                System.err.println("FATAL: Could not read trace file " + fileName);
+                return;
+            }
+        }
 
-        // 4. Start all the threads
-        System.out.println("--- Starting Multi-Threaded Simulation with " + threads.size() + " processes ---");
-        for (Thread t : threads) {
+        // Start all the initial threads
+        System.out.println("--- Starting Multi-Threaded Simulation with " + initialThreads.size() + " initial processes ---");
+        for (Thread t : initialThreads) {
             t.start();
         }
 
-        // 5. Wait for ALL threads to finish (join)
+        // Wait for all threads to arrive to the phaser
         try {
-            for (Thread t : threads) {
-                t.join();
-            }
-        } catch (InterruptedException e) {
+            sharedSimulator.phaser.arriveAndAwaitAdvance();
+        } catch (Exception e) {
             System.err.println("Main thread interrupted while waiting for processes.");
             e.printStackTrace();
-            Thread.currentThread().interrupt(); // Restore interrupted status
         }
 
         System.out.println(  "\n---- Final Frame Table ----\n" +sharedSimulator.frameTable);
@@ -273,9 +277,7 @@ public class Simulator {
             System.out.println("NOT ALL FRAMES FREE :(");
         }
 
-
-
-        // 6. Print final statistics
+        // Print final statistics
         sharedSimulator.printStatistics();
     }
 }
