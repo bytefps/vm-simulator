@@ -302,4 +302,58 @@ public class SPT {
             sourcePTE.lock.unlock();
         }
     }
+
+    public SPT fork() {
+        // Create the new SPT for the child
+        SPT childSPT = new SPT(
+                this.processID + "-child",
+                this.frameTable,
+                this.stats
+        );
+
+        //  Iterate over every *parent* PTE and create a
+        //    shared CoW mapping in the child.
+        for (PTE parentPTE : this.entries.values()) {
+            parentPTE.lock.lock();
+            try {
+                //  Create a matching PTE for the child
+                PTE childPTE;
+                if (parentPTE.type == PTE.PageType.ANONYMOUS) {
+                    childPTE = new PTE(parentPTE.vaddr, parentPTE.fundamentalWritable, childSPT.processID);
+                } else {
+                    childPTE = new PTE(parentPTE.vaddr, parentPTE.fundamentalWritable, childSPT.processID, parentPTE.filename, parentPTE.fileOffset);
+                }
+
+                // Set up the CoW
+                parentPTE.isCopyOnWrite = true;
+                childPTE.isCopyOnWrite = true;
+
+                parentPTE.writable = false;
+                childPTE.writable = false;
+
+                // Make the child PTE share the parent's data
+                childPTE.inFrame = parentPTE.inFrame;
+                childPTE.frame = parentPTE.frame;
+                childPTE.onSwap = parentPTE.onSwap;
+
+                //  If it's in a frame, add the child as a sharer
+                if (childPTE.inFrame) {
+                    Frame sharedFrame = childPTE.frame;
+                    sharedFrame.lock.lock(); // pte.lock -> frame.lock
+                    try {
+                        sharedFrame.ptes.add(childPTE);
+                    } finally {
+                        sharedFrame.lock.unlock();
+                    }
+                }
+
+                // Add the new PTE to the child's table
+                childSPT.entries.put(childPTE.vaddr, childPTE);
+
+            } finally {
+                parentPTE.lock.unlock();
+            }
+        }
+        return childSPT;
+    }
 }

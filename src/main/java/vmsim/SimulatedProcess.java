@@ -47,6 +47,21 @@ public class SimulatedProcess implements Runnable {
         this.isForkedChild = false;
     }
 
+    /**
+     * Constructor for a FORKED  process.
+     * Shares the parent's commands and starts at the parent's next PC.
+     */
+    private SimulatedProcess(Simulator simulator, SPT childSPT, List<String> allCommands, int startPC, String parentPID, Phaser phaser) {
+        this.simulator = simulator;
+        this.phaser = phaser;
+        this.processID = parentPID + "-child"; // e.g. "trace_t1.txt-child"
+        this.spt = childSPT; // Receives the forked SPT
+        this.allCommands = allCommands; // Shares the same command list
+        this.pc = startPC; // Starts where the parent left off
+        this.isForkedChild = true;
+    }
+
+
     @Override
     public void run() {
         if (isForkedChild) {
@@ -117,6 +132,32 @@ public class SimulatedProcess implements Runnable {
                             int newPageKey = newAddress >> PAGE_SHIFT;
                             int sourcePageKey = sourceAddress >> PAGE_SHIFT;
                             spt.setupCopyOnWrite(newPageKey, sourcePageKey);
+                            break;
+
+                        case "K": // "K" for forK (F is already taken :( )
+                            simulator.log("--- [PID: " + processID + "] FORKING... ---");
+
+                            // Fork the memory
+                            SPT childSPT = this.spt.fork();
+
+                            //  Create the new child process
+                            //    It shares our command list
+                            //    Its PC starts at *our next command* (pc + 1)
+                            SimulatedProcess child = new SimulatedProcess(
+                                    this.simulator,
+                                    childSPT,
+                                    this.allCommands,
+                                    this.pc + 1, // Child starts at the next line
+                                    this.processID,
+                                    this.phaser
+                            );
+
+                            // Start the child thread
+                            Thread childThread = new Thread(child, child.processID);
+                            childThread.start();
+
+                            // The child will call phaser.register() itself
+                            // The parent just continues its loop.
                             break;
 
                         default:
