@@ -6,6 +6,14 @@ import java.util.concurrent.locks.ReentrantLock;
 
 public class Frame {
 
+    // We pad this object to prevent FALSE SHARING.
+    // A Frame object is small. Without padding, multiple Frames could fit
+    // on a single 64-byte CPU cache line. If Thread A locks Frame 0 and
+    // Thread B locks Frame 1, they would invalidate each other's cache lines,
+    // killing performance.
+    // These unused longs force each Frame to live on its own cache line.
+    private long p1, p2, p3, p4, p5, p6, p7;
+
     public final int kpage; // Kernel address of the frame
 
     public final ReentrantLock lock; // Used to sync access to frame
